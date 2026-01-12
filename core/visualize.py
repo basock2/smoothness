@@ -7,6 +7,7 @@ import sac
 import numpy as np
 import scipy.fft
 import matplotlib.cm as cm
+import torch.nn as nn
 
 def plot_qf(actor, q1, device, trajs=None, save_path=None):
     xs = torch.linspace(-4, 4, 25).to(device)
@@ -45,35 +46,41 @@ def plot_qf(actor, q1, device, trajs=None, save_path=None):
     else:
         plt.show()
 
+import numpy as np
+
 
 def smoothness_score(actions, dt=0.1, print_score=True):
     if isinstance(actions, np.ndarray):
         actions = [actions]
+        
     fs = 1.0 / dt
     scores = []
 
     for action in actions:
-        # (T, D) -> T: Time steps, D: Dimensions (x, y)
-        T, D = action.shape
+        a = np.array(action, dtype=float)
+        if a.ndim == 1:
+            a = a[:, None]
 
-        if T < 4:
+        n, d = a.shape
+        if n < 2:
+            scores.append(0.0)
             continue
 
-        for d in range(D):
-            signal = action[:, d]
-            signal = signal - np.mean(signal)
-            yf = scipy.fft.rfft(signal)
-            xf = scipy.fft.rfftfreq(T, d=dt)
-            power = np.abs(yf) ** 2
-            weighted_power = np.sum(power * xf)
-            smoothness = 2 * weighted_power / (fs * T)
+        yf = np.fft.fft(a, axis=0)
+        cutoff = n // 2
+        yf = yf[:cutoff, :]
         
-        dim_avg_smoothness = smoothness / D
-        scores.append(dim_avg_smoothness)
+        freqs = np.fft.fftfreq(n, d=dt)[:cutoff]
+        freqs = freqs.reshape(-1, 1)
+        
+        weighted_sum = np.sum(freqs * np.abs(yf), axis=0) 
+        smooth_per_dim = (2.0 / (n * fs)) * weighted_sum
+        scores.append(float(np.mean(smooth_per_dim)))
 
     mean_score = np.mean(scores) if scores else 0.0
     if print_score:
         print("Mean smoothness score:", mean_score)
+    
     return mean_score, scores
 
 
@@ -945,3 +952,34 @@ def plot_fisher_ratio(
         plt.close()
     else:
         plt.show()
+
+
+def get_spectral_norms(model):
+    norms = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if hasattr(module, 'weight_orig'):
+                norms[f"{name}_orig"] = torch.linalg.norm(module.weight_orig.detach(), ord=2).item()
+            
+            norms[f"{name}_eff"] = torch.linalg.norm(module.weight.detach(), ord=2).item()
+    return norms
+
+
+def plot_spectral_norms(norm_history, save_path):
+    plt.figure(figsize=(12, 6))
+    
+    for name, values in norm_history.items():
+        linestyle = ':' if 'orig' in name else '-'
+        linewidth = 1.5 if 'eff' in name else 1.0
+        alpha = 0.9 if 'eff' in name else 0.6
+        
+        plt.plot(values, label=name, linestyle=linestyle, linewidth=linewidth, alpha=alpha)
+    
+    plt.xlabel("Step (x100)")
+    plt.ylabel("Spectral Norm (L2)")
+    plt.title("Spectral Norm Evolution")
+    plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, "spectral_norm_evolution.png"), dpi=300)
+    plt.close()

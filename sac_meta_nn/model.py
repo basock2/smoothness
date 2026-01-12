@@ -51,9 +51,9 @@ class QNet(nn.Module):
 
 
 def sac_update(
-    actor, q1, q2, q1_t, q2_t, dynamics,
-    opt_a, opt_q1, opt_q2, opt_dynamics,
-    batch, alpha=0.2, gamma=0.99, tau=0.005, eps=0.5,
+    actor_mf, actor_mb, q1, q2, q1_t, q2_t, dynamics, lambda_net,
+    opt_a_mf, opt_a_mb, opt_q1, opt_q2, opt_dynamics, opt_lambda,
+    batch, alpha=0.2, gamma=0.99, tau=0.005, eps=0.01
 ):
     s, a, r, ns, d = batch
 
@@ -62,10 +62,15 @@ def sac_update(
     dynamics_loss = F.mse_loss(pred_ns, ns)
     opt_dynamics.zero_grad(); dynamics_loss.backward(); opt_dynamics.step()
 
-    # ----- Critic -----
+    # ----- Critic ----- (trained with behavior policy)
     with torch.no_grad():
         r = r.squeeze(-1); d = d.squeeze(-1)
-        na, nlogp = actor.sample(ns)
+        lamb_ns = lambda_net(ns)
+        na_mf, nlogp_mf = actor_mf.sample(ns)
+        na_mb, nlogp_mb = actor_mb.sample(ns)
+
+        na = torch.where(lamb_ns.unsqueeze(-1) < 0.5, na_mb, na_mf)
+        nlogp = torch.where(lamb_ns < 0.5, nlogp_mb, nlogp_mf)
         tq = torch.min(q1_t(ns, na), q2_t(ns, na))
         target = r + gamma * (1 - d) * (tq - alpha * nlogp)
 
@@ -75,26 +80,28 @@ def sac_update(
     opt_q1.zero_grad(); q1_loss.backward(); opt_q1.step()
     opt_q2.zero_grad(); q2_loss.backward(); opt_q2.step()
 
-    # ----- Fisher -----
-    I = q_fisher(q1, q2, s, a).detach()
-    I_ = model_based_q_fisher(actor, q1, q2, dynamics, s, a).detach()
-    lamb = fisher_lamb(I, I_, eps=eps)
+    # ----- Actor ----- (model-free)
+    na, logp = actor_mf.sample(s)
+    q_val = torch.min(q1(s, na), q2(s, na))
 
-    # ----- Actor -----
-    a, logp = actor.sample(s)
-    q_val = torch.min(q1(s, a), q2(s, a))
+    actor_loss_mf = (alpha * logp - q_val).mean()
 
+    opt_a_mf.zero_grad()
+    actor_loss_mf.backward()
+    opt_a_mf.step()
+
+    # ----- Actor ----- (model-based)
+    a, logp = actor_mb.sample(s)
     pred_ns = dynamics(s, a)
-    na, nlogp = actor.sample(pred_ns)
-    nq_val = torch.min(q1(pred_ns, na), q2(pred_ns, na))
-    q_val_ = r + gamma * nq_val
+    na, nlogp = actor_mb.sample(pred_ns)
+    q_val = torch.min(q1(pred_ns, na), q2(pred_ns, na))
+    target = r + gamma * (1 - d) * q_val
 
-    target = lamb * q_val + (1 - lamb) * q_val_
-    actor_loss = (alpha * logp - target).mean()
+    actor_loss_mb = (alpha * logp - target).mean()
 
-    opt_a.zero_grad()
-    actor_loss.backward()
-    opt_a.step()
+    opt_a_mb.zero_grad()
+    actor_loss_mb.backward()
+    opt_a_mb.step()
 
     # ----- Target update -----
     for p, pt in zip(q1.parameters(), q1_t.parameters()):
@@ -102,9 +109,60 @@ def sac_update(
     for p, pt in zip(q2.parameters(), q2_t.parameters()):
         pt.data.mul_(1 - tau).add_(tau * p.data)
 
+    # ----- Lambda -----
+    K = 5
+    lamb = lambda_net(s).squeeze(-1)  # [B]
+
+    # [B, K, state_dim]
+    noise = torch.randn(
+        s.shape[0], K, s.shape[1],
+        device=s.device
+    )
+    s_d = s.unsqueeze(1) + eps * noise
+
+    # ---- MF smoothness ----
+    with torch.no_grad():
+        a_mf_s, _ = actor_mf.sample(s)  # [B, A]
+        a_mf_s = a_mf_s.unsqueeze(1)  # [B, 1, A]
+
+        a_mf_sd, _ = actor_mf.sample(
+            s_d.reshape(-1, s.shape[1])
+        )  # [B*K, A]
+        a_mf_sd = a_mf_sd.view(s.shape[0], K, -1)  # [B, K, A]
+
+        smooth_mf = ((a_mf_s - a_mf_sd) ** 2).mean(dim=-1)  # [B, K]
+        smooth_mf = smooth_mf.mean(dim=1)  # [B]
+
+    # ---- MB smoothness ----
+    with torch.no_grad():
+        a_mb_s, _ = actor_mb.sample(s)
+        a_mb_s = a_mb_s.unsqueeze(1)
+
+        a_mb_sd, _ = actor_mb.sample(
+            s_d.reshape(-1, s.shape[1])
+        )
+        a_mb_sd = a_mb_sd.view(s.shape[0], K, -1)
+
+        smooth_mb = ((a_mb_s - a_mb_sd) ** 2).mean(dim=-1)
+        smooth_mb = smooth_mb.mean(dim=1)
+
+    # ---- target for lambda ----
+    margin = 1e-3
+    target_lambda = (smooth_mf + margin < smooth_mb).float()
+
+    lambda_loss = F.binary_cross_entropy(
+        lamb,
+        target_lambda
+    )
+
+    opt_lambda.zero_grad()
+    lambda_loss.backward()
+    opt_lambda.step()
+
     return {
         "model_loss": dynamics_loss.item(),
-        "actor_loss": actor_loss.item(),
+        "actor_loss_mf": actor_loss_mf.item(),
+        "actor_loss_mb": actor_loss_mb.item(),
     }
 
 def q_state_gradient_field(actor, q, xs, ys):
@@ -205,44 +263,22 @@ class DynamicsModel(nn.Module):
         return model_action_grad
 
 
-def q_fisher(q1, q2, s, a):
-    a = a.detach().clone()
-    a.requires_grad = True
-    q_val = torch.min(q1(s, a), q2(s, a))
-    q_grad = torch.autograd.grad(
-        outputs=q_val.sum(), 
-        inputs=a, 
-        create_graph=False, 
-        retain_graph=False
-    )[0]
-    FI = torch.sum(q_grad ** 2, dim=-1)
+class LambdaModel(nn.Module):
+    def __init__(self, state_dim=2, hidden=256):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.lamb = nn.Linear(hidden, 1)
 
-    return FI
+        self.state_dim = state_dim
 
-
-def model_based_q_fisher(actor, q1, q2, dynamics, s, a):
-    a = a.detach().clone()
-    a.requires_grad = True
-    ns = dynamics.forward(s, a)
-    mu, _ = actor.forward(ns)
-    na = torch.tanh(mu)
-    qval = torch.min(q1(ns, na), q2(ns, na))
-    model_q_grad = torch.autograd.grad(
-        outputs=qval.sum(),
-        inputs=a,
-        create_graph=False, 
-        retain_graph=False
-    )[0]
-    FI = torch.sum(model_q_grad ** 2, dim=-1)
-
-    return FI
-
-
-def fisher_lamb(I, I_, eps=0.5):
-    lamb = eps * I / (eps * I + (1 - eps) * I_)
-
-    return lamb
-
+    def forward(self, s):
+        x = s
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        lamb = self.lamb(x)
+        return torch.sigmoid(lamb).squeeze(-1)
+    
 
 def actor_mu(actor, s):
     mu, _ = actor(s)

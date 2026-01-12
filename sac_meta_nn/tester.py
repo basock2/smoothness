@@ -1,9 +1,11 @@
 import numpy as np
 import torch
-import sac_meta as sac
+import sac_meta_nn as sac
 
-def test_policy(env, actor, device, episodes=5):
-    actor.eval()
+def test_policy(env, actor_mf, actor_mb, lambda_net, device, episodes=5):
+    actor_mf.eval()
+    actor_mb.eval()
+    lambda_net.eval()
     traj_list = []
     action_list = []
     total_r_list = []
@@ -17,8 +19,11 @@ def test_policy(env, actor, device, episodes=5):
 
         while True:
             with torch.no_grad():
-                a = sac.actor_mu(actor, s.unsqueeze(0))
-                a = a.squeeze(0)
+                lamb = lambda_net(s.unsqueeze(0))  # add batch dim
+                a_mf = sac.actor_mu(actor_mf, s.unsqueeze(0))
+                a_mb = sac.actor_mu(actor_mb, s.unsqueeze(0))
+                a = torch.where(lamb < 0.5, a_mb, a_mf)
+                a = a.squeeze(0)  # remove batch dim
 
             ns, r, done, trunc, _ = env.step(a.cpu().numpy())
             ns = torch.tensor(ns, dtype=torch.float32).to(device)
@@ -38,6 +43,8 @@ def test_policy(env, actor, device, episodes=5):
         print(f"[Test] Episode {ep} | Return {total_r:.2f}")
         total_r_list.append(total_r)
 
-    actor.train()
+    actor_mf.train()
+    actor_mb.train()
+    lambda_net.train()
     print(f"[Test] Mean Return {np.mean(total_r_list):.2f}")
     return traj_list, action_list

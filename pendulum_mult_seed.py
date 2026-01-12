@@ -44,7 +44,7 @@ for seed in seed_list:
     buffer = sac.ReplayBuffer()
 
     # --------train--------
-    num_episodes = 30
+    num_episodes = 200
     batch_size = 128
     start_steps = 1000
     updates_per_step = 1

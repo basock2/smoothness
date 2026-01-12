@@ -29,7 +29,7 @@ def train_model(env, num_episodes, batch_size, start_steps, updates_per_step, se
                     a, _ = actor.sample(s.unsqueeze(0))  # add batch dim
                     a = a.squeeze(0)  # remove batch dim
 
-            ns, r, done, trunc, _ = env.step(a.cpu().numpy())
+            ns, r, done, trunc, _ = env.step(scale_action(a, env).cpu().numpy())
             ns = torch.tensor(ns, dtype=torch.float32).to(device)
             r = torch.tensor([r], dtype=torch.float32).to(device)
             d = torch.tensor([done], dtype=torch.float32).to(device)
@@ -74,3 +74,9 @@ def train_model(env, num_episodes, batch_size, start_steps, updates_per_step, se
             f"[Train] Ep {ep:03d} | Return {ep_reward:.2f} "
             f"| ModelLoss {curr_model_loss:.4f} | lamb {lamb:.3f}"
         )
+
+
+def scale_action(a, env):
+    low = torch.as_tensor(env.action_space.low, device=a.device)
+    high = torch.as_tensor(env.action_space.high, device=a.device)
+    return low + (a + 1.0) * 0.5 * (high - low)

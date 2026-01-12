@@ -1,15 +1,14 @@
 import numpy as np
 import torch
-import sac_meta_soft as sac
+import sac_interneuron as sac
+import collections
+import core as c
 
 def train_model(env, num_episodes, batch_size, start_steps, updates_per_step, seed, 
-          actor, q1, q2, q1_t, q2_t, dynamics, opt_a, opt_q1, opt_q2, opt_dynamics, buffer, device, 
-          alpha=0.2, eps=0.95, k_eps=1.0):
+          actor, q1, q2, q1_t, q2_t, dynamics, opt_a, opt_q1, opt_q2, opt_dynamics, buffer, device):
     total_steps = 0
+    norm_history = collections.defaultdict(list)
     env.reset(seed=seed)
-    prev_model_loss = None
-    eps_min, eps_max = 0.05, 0.95
-
     for ep in range(num_episodes):
         ep_seed = seed + ep
         env.action_space.seed(ep_seed)
@@ -17,7 +16,6 @@ def train_model(env, num_episodes, batch_size, start_steps, updates_per_step, se
         s = torch.tensor(s, dtype=torch.float32).to(device)
 
         ep_reward = 0
-        episode_model_losses = []
 
         while True:
             # -------- action selection --------
@@ -41,7 +39,7 @@ def train_model(env, num_episodes, batch_size, start_steps, updates_per_step, se
                 ns.detach().cpu(), 
                 d.detach().cpu()
             )
-            
+
             s = ns
             ep_reward += r.item()
             total_steps += 1
@@ -51,29 +49,21 @@ def train_model(env, num_episodes, batch_size, start_steps, updates_per_step, se
                 for _ in range(updates_per_step):
                     batch = buffer.sample(batch_size)
                     batch = [x.to(device) for x in batch]
-                    info = sac.sac_update(
+                    sac.sac_update(
                         actor, q1, q2, q1_t, q2_t, dynamics,
                         opt_a, opt_q1, opt_q2, opt_dynamics,
-                        batch, alpha=alpha, eps=eps,
+                        batch,
                     )
-                    if info is not None and "model_loss" in info:
-                        episode_model_losses.append(info["model_loss"])
+                if total_steps % 100 == 0:
+                    current_norms = c.get_spectral_norms(actor)
+                    for k, v in current_norms.items():
+                        norm_history[k].append(v)
 
             if done or trunc:
                 break
 
-        if len(episode_model_losses) > 0:
-            curr_model_loss = np.mean(episode_model_losses)
-            if prev_model_loss is not None:
-                delta_L = (prev_model_loss - curr_model_loss) / (prev_model_loss + 1e-8)
-                eps = eps * np.exp(-k_eps * delta_L)
-                eps = float(np.clip(eps, eps_min, eps_max))
-            prev_model_loss = curr_model_loss
-
-        print(
-            f"[Train] Ep {ep:03d} | Return {ep_reward:.2f} "
-            f"| ModelLoss {curr_model_loss:.4f} | eps {eps:.3f}"
-        )
+        print(f"[Train] Episode {ep:03d} | Return {ep_reward:.2f}")
+    return norm_history
 
 
 def scale_action(a, env):

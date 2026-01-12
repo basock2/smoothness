@@ -1,10 +1,13 @@
 import numpy as np
 import torch
 import sac
+import collections
+import core as c
 
 def train_model(env, num_episodes, batch_size, start_steps, updates_per_step, seed, 
           actor, q1, q2, q1_t, q2_t, dynamics, opt_a, opt_q1, opt_q2, opt_dynamics, buffer, device):
     total_steps = 0
+    norm_history = collections.defaultdict(list)
     env.reset(seed=seed)
     for ep in range(num_episodes):
         ep_seed = seed + ep
@@ -51,11 +54,16 @@ def train_model(env, num_episodes, batch_size, start_steps, updates_per_step, se
                         opt_a, opt_q1, opt_q2, opt_dynamics,
                         batch,
                     )
+                if total_steps % 100 == 0:
+                    current_norms = c.get_spectral_norms(actor)
+                    for k, v in current_norms.items():
+                        norm_history[k].append(v)
 
             if done or trunc:
                 break
 
         print(f"[Train] Episode {ep:03d} | Return {ep_reward:.2f}")
+    return norm_history
 
 
 def scale_action(a, env):

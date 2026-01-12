@@ -240,3 +240,8 @@ def model_based_q_fisher(actor, q1, q2, dynamics, s, a):
     FI = torch.sum(model_q_grad ** 2, dim=-1)
 
     return FI
+
+
+def actor_mu(actor, s):
+    mu, _ = actor(s)
+    return torch.tanh(mu)

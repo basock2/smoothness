@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-import sac_meta as sac
+import sac_interneuron as sac
 
 def test_policy(env, actor, device, episodes=5):
     actor.eval()

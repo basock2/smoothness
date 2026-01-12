@@ -12,9 +12,14 @@ class Actor(nn.Module):
         self.mu = nn.Linear(hidden, action_dim)
         self.log_std = nn.Linear(hidden, action_dim)
 
+        self.in1 = nn.utils.spectral_norm(nn.Linear(hidden, hidden))
+        self.in2 = nn.utils.spectral_norm(nn.Linear(hidden, hidden))
+
     def forward(self, s):
-        x = F.relu(self.fc1(s))
-        x = F.relu(self.fc2(x))
+        in1 = F.relu(self.in1(F.relu(self.fc1(s))))
+        x = F.relu(self.fc1(s) - in1)
+        in2 = F.relu(self.in2(F.relu(self.fc2(x))))
+        x = F.relu(self.fc2(x) - in2)
         mu = self.mu(x)
         log_std = self.log_std(x).clamp(-20, 2)
         std = log_std.exp()
@@ -34,6 +39,21 @@ class Actor(nn.Module):
         logp -= torch.log(1 - a.pow(2) + 1e-6).sum(-1)
 
         return a, logp
+    
+    def get_optimizer_params(self, default_decay=1e-4):
+        in_params = []
+        base_params = []
+        
+        for name, param in self.named_parameters():
+            if 'in' in name:
+                in_params.append(param)
+            else:
+                base_params.append(param)
+
+        return [
+            {'params': base_params, 'weight_decay': default_decay},
+            {'params': in_params, 'weight_decay': 0.0}
+        ]
 
 
 class QNet(nn.Module):
@@ -53,7 +73,7 @@ class QNet(nn.Module):
 def sac_update(
     actor, q1, q2, q1_t, q2_t, dynamics,
     opt_a, opt_q1, opt_q2, opt_dynamics,
-    batch, alpha=0.2, gamma=0.99, tau=0.005, eps=0.5,
+    batch, alpha=0.2, gamma=0.99, tau=0.005, eps=0.01, K=10, target_ratio=0.0
 ):
     s, a, r, ns, d = batch
 
@@ -61,6 +81,22 @@ def sac_update(
     pred_ns = dynamics(s, a)
     dynamics_loss = F.mse_loss(pred_ns, ns)
     opt_dynamics.zero_grad(); dynamics_loss.backward(); opt_dynamics.step()
+
+    # ----- Interneuron -----
+    noise = torch.randn(
+        s.shape[0], K, s.shape[1],
+        device=s.device
+    )  # [B, K, state_dim]
+    s_d = s.unsqueeze(1) + eps * noise
+
+    a_s = actor_mu(actor, s)  # [B, A]
+    a_s = a_s.detach().unsqueeze(1)  # [B, 1, A]
+    a_sd = actor_mu(actor, s_d.reshape(-1, s.shape[1]))  # [B*K, A]
+    a_sd = a_sd.view(s.shape[0], K, -1)  # [B, K, A]
+
+    smoothness = ((a_s - a_sd) ** 2).mean(dim=-1)  # [B, K]
+    smoothness, _ = smoothness.max(dim=1)  # [B]
+    smoothness_loss = smoothness.mean()
 
     # ----- Critic -----
     with torch.no_grad():
@@ -75,23 +111,20 @@ def sac_update(
     opt_q1.zero_grad(); q1_loss.backward(); opt_q1.step()
     opt_q2.zero_grad(); q2_loss.backward(); opt_q2.step()
 
-    # ----- Fisher -----
-    I = q_fisher(q1, q2, s, a).detach()
-    I_ = model_based_q_fisher(actor, q1, q2, dynamics, s, a).detach()
-    lamb = fisher_lamb(I, I_, eps=eps)
-
     # ----- Actor -----
-    a, logp = actor.sample(s)
-    q_val = torch.min(q1(s, a), q2(s, a))
+    na, logp = actor.sample(s)
+    q_val = torch.min(q1(s, na), q2(s, na))
+    sac_loss = (alpha * logp - q_val).mean()
 
-    pred_ns = dynamics(s, a)
-    na, nlogp = actor.sample(pred_ns)
-    nq_val = torch.min(q1(pred_ns, na), q2(pred_ns, na))
-    q_val_ = r + gamma * nq_val
+    mag_sac = torch.abs(sac_loss).detach()
+    mag_smooth = torch.abs(smoothness_loss).detach()
+    if mag_smooth > 1e-9:
+        lamb = (mag_sac / (mag_smooth + 1e-8)) * target_ratio
+    else:
+        lamb = 0.0
+    lamb = torch.clamp(lamb, max=1e5)
 
-    target = lamb * q_val + (1 - lamb) * q_val_
-    actor_loss = (alpha * logp - target).mean()
-
+    actor_loss = sac_loss + lamb * smoothness_loss
     opt_a.zero_grad()
     actor_loss.backward()
     opt_a.step()
@@ -102,10 +135,7 @@ def sac_update(
     for p, pt in zip(q2.parameters(), q2_t.parameters()):
         pt.data.mul_(1 - tau).add_(tau * p.data)
 
-    return {
-        "model_loss": dynamics_loss.item(),
-        "actor_loss": actor_loss.item(),
-    }
+    return actor_loss.item()
 
 def q_state_gradient_field(actor, q, xs, ys):
     grid = torch.stack(
@@ -238,10 +268,9 @@ def model_based_q_fisher(actor, q1, q2, dynamics, s, a):
     return FI
 
 
-def fisher_lamb(I, I_, eps=0.5):
-    lamb = eps * I / (eps * I + (1 - eps) * I_)
-
-    return lamb
+def set_requires_grad(module, flag):
+    for p in module.parameters():
+        p.requires_grad = flag
 
 
 def actor_mu(actor, s):

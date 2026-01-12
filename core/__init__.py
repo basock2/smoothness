@@ -1,3 +1,3 @@
 from .environment import PointMass2D
-from .visualize import plot_qf, smoothness_score, plot_grad_a, plot_grad_a_target, plot_smoothness_vs_distance, plot_fisher_vs_distance, plot_fisher_difference, plot_fisher_ratio
+from .visualize import plot_qf, smoothness_score, plot_grad_a, plot_grad_a_target, plot_smoothness_vs_distance, plot_fisher_vs_distance, plot_fisher_difference, plot_fisher_ratio, get_spectral_norms, plot_spectral_norms
 from .pendulum_visualize import obs_to_theta, plot_pendulum_trajectories, plot_q_gradient_field_pendulum, pendulum_distance, visualize_pendulum_results

@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import sac_model as sac
 
 def test_policy(env, actor, device, episodes=5):
     actor.eval()
@@ -16,7 +17,7 @@ def test_policy(env, actor, device, episodes=5):
 
         while True:
             with torch.no_grad():
-                a, _ = actor.sample(s.unsqueeze(0))
+                a = sac.actor_mu(actor, s.unsqueeze(0))
                 a = a.squeeze(0)
 
             ns, r, done, trunc, _ = env.step(a.cpu().numpy())
